@@ -1,8 +1,9 @@
 "use server";
 
-import { currentUser } from "@clerk/nextjs";
+import { currentUser, clerkClient } from "@clerk/nextjs";
 import { db } from "./db";
-import { redirect } from "@clerk/nextjs/server";
+import { redirect } from "next/navigation";
+import { User } from "@prisma/client";
 
 export const getAuthUserDetails = async () => {
   const user = await currentUser();
@@ -24,6 +25,69 @@ export const getAuthUserDetails = async () => {
   return userData;
 };
 
+export const saveActiviityLogsNotification = async ({
+  agencyId,
+  description,
+  subaccountId,
+}: {
+  agencyId?: string;
+  description: string;
+  subaccountId?: string;
+}) => {
+  const authUser = await currentUser();
+  let userData;
+  if (!authUser) {
+    const response = await db.user.findFirst({
+      where: { Agency: { SubAccount: { some: { id: subaccountId } } } },
+    });
+    if (response) {
+      userData = response;
+    }
+  } else {
+    userData = await db.user.findUnique({
+      where: { email: authUser?.emailAddresses[0].emailAddress },
+    });
+  }
+  if (!userData) {
+    console.log("Could not find user");
+    return;
+  }
+  let foundAgencyId = agencyId;
+  if (!foundAgencyId) {
+    if (!subaccountId) {
+      throw new Error("Please provide a agency or subaccount Id");
+    }
+    const response = await db.subAccount.findUnique({
+      where: { id: subaccountId },
+    });
+    if (response) foundAgencyId = response.agencyId;
+  }
+  if (subaccountId) {
+    await db.notification.create({
+      data: {
+        notification: `${userData.name} | ${description}`,
+        User: { connect: { id: userData.id } },
+        Agency: { connect: { id: foundAgencyId } },
+        SubAccount: { connect: { id: subaccountId } },
+      },
+    });
+  } else {
+    await db.notification.create({
+      data: {
+        notification: `${userData.name} | ${description}`,
+        User: { connect: { id: userData.id } },
+        Agency: { connect: { id: foundAgencyId } },
+      },
+    });
+  }
+};
+
+export const createTeamUser = async (agencyId: string, user: User) => {
+  if (user.role === "AGENCY_OWNER") return null;
+  const response = await db.user.create({ data: { ...user } });
+  return response;
+};
+
 export const verifyAndAcceptInvite = async () => {
   const user = await currentUser();
   if (!user) return redirect("/sign-in");
@@ -31,8 +95,33 @@ export const verifyAndAcceptInvite = async () => {
     where: { email: user.emailAddresses[0].emailAddress, status: "PENDING" },
   });
   if (inviteExists) {
-    const userDetails = await createTeamUser(inviteExists.agencyId, {});
+    const userDetails = await createTeamUser(inviteExists.agencyId, {
+      email: inviteExists.email,
+      agencyId: inviteExists.agencyId,
+      avatarUrl: user.imageUrl,
+      id: user.id,
+      name: `${user.firstName} ${user.lastName}`,
+      role: inviteExists.role,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await saveActiviityLogsNotification({
+      agencyId: inviteExists?.agencyId,
+      description: "Joined",
+      subaccountId: undefined,
+    });
+    if (userDetails) {
+      await clerkClient.users.updateUserMetadata(user.id, {
+        privateMetadata: { role: userDetails.role || "SUBACCOUNT_USER" },
+      });
+      await db.invitation.delete({ where: { email: userDetails.email } });
+
+      return userDetails.agencyId;
+    } else return null;
+  } else {
+    const agency = await db.user.findUnique({
+      where: { email: user.emailAddresses[0].emailAddress },
+    });
+    return agency ? agency.agencyId : null;
   }
 };
-
-// Build team user and fix the pther error
